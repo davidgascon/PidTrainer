@@ -1281,9 +1281,32 @@ export default function App() {
 
   return (
     <div style={{ background: C.chassis, minHeight: "100vh", padding: 12, fontFamily: FONT_B, color: C.ink }}>
+      <div className="lab-shell">
       <style>{`
         button:focus-visible, input:focus-visible { outline: 2px solid ${C.chw}; outline-offset: 2px; }
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+        /* Phone first: one column, nothing to do. */
+        .lab-shell { max-width: 620px; margin: 0 auto; }
+        .lab-grid { display: block; }
+
+        /* Desktop: trend and readouts on the left, the things you touch on
+           the right, so the chart stays visible while you adjust. */
+        @media (min-width: 900px) {
+          .lab-shell { max-width: 1180px; }
+          .lab-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+            gap: 12px;
+            align-items: start;
+          }
+          .lab-col > *:first-child { margin-top: 0 !important; }
+          .lab-col-right { position: sticky; top: 12px; }
+        }
+
+        @media (min-width: 1400px) {
+          .lab-shell { max-width: 1320px; }
+        }
       `}</style>
 
       <div style={{ background: C.bezel, borderRadius: "5px 5px 0 0", padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10 }}>
@@ -1309,6 +1332,9 @@ export default function App() {
           <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15 }}>{hints} hints</span>
         </div>
       )}
+
+      <div className="lab-grid">
+      <div className="lab-col">
 
       <div style={{ background: C.bezel, padding: "10px 10px 6px", borderRadius: "0 0 5px 5px" }}>
         <div style={{ background: C.paper, borderRadius: 3, overflow: "hidden" }}>
@@ -1355,6 +1381,9 @@ export default function App() {
           </div>
         </div>
       )}
+
+      </div>
+      <div className="lab-col lab-col-right">
 
       <div style={{ ...card, display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button
@@ -1447,7 +1476,11 @@ export default function App() {
         </div>
       </div>
 
+      </div>
+      </div>
+
       <div style={{ textAlign: "center", fontSize: 11, color: C.label, padding: "14px 0 6px" }}>Loop Lab · training mode</div>
+      </div>
 
       {help && (
         <HelpSheet
