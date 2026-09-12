@@ -1,0 +1,55 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: loop-lab:latest
+    container_name: loop-lab
+    restart: unless-stopped
+    ports:
+      # host:container — change the host side if 8080 is taken
+      - "8080:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+
+# ---------------------------------------------------------------------------
+# When competition mode needs real accounts and a shared leaderboard, add an
+# api service and a database here, and point nginx at the api with a
+# `location /api/ { proxy_pass http://api:3000/; }` block. Sketch:
+#
+#   api:
+#     build: ./api
+#     environment:
+#       DATABASE_URL: postgres://looplab:${DB_PASSWORD}@db:5432/looplab
+#       JWT_SECRET: ${JWT_SECRET}
+#     depends_on:
+#       db:
+#         condition: service_healthy
+#
+#   db:
+#     image: postgres:16-alpine
+#     environment:
+#       POSTGRES_USER: looplab
+#       POSTGRES_PASSWORD: ${DB_PASSWORD}
+#       POSTGRES_DB: looplab
+#     volumes:
+#       - pgdata:/var/lib/postgresql/data
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U looplab"]
+#       interval: 10s
+#       retries: 5
+#
+# volumes:
+#   pgdata:
+# ---------------------------------------------------------------------------

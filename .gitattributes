@@ -1,0 +1,16 @@
+# Normalise line endings. Without this, Git for Windows checks these files out
+# with CRLF, and a shell script or Dockerfile with CRLF fails on a Linux server
+# with "bad interpreter" or a stray \r.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.conf      text eol=lf
+
+*.png binary
+*.jpg binary
+*.woff binary
+*.woff2 binary
+*.tar.gz binary
