@@ -553,10 +553,11 @@ const HELP = {
   ec: {
     title: "Error coefficient",
     short:
-      "Multiplies the error before it reaches the PID block, so the controller sees a bigger or smaller number than the sensor actually reports. Effective gain is the gain dial times this coefficient. It is a workaround for a gain range that cannot reach what your loop needs.",
+      "Multiplies the setpoint and the measured value separately, before either one reaches the PID block, so the block works in scaled units rather than engineering units. Effective gain is the gain dial times this coefficient. It is a workaround for a gain range that cannot reach what your loop needs.",
     more: [
       { h: "Why it exists", p: "A controller's gain range is fixed, but the numbers a loop needs depend entirely on the units of the measurement. A building static loop working in hundredths of an inch of water can need an effective gain of several hundred percent per inch. A box airflow loop working in cfm can need less than a tenth of a percent per cfm. Neither number is reachable on a dial that stops at 50 and starts at 0.1. Scaling the error moves the whole problem into a range the dial can express." },
-      { h: "It is exactly a gain multiplier", p: "Multiplying the error by four and leaving the gain alone gives you precisely the same loop as leaving the error alone and multiplying the gain by four. There is no extra magic and no hidden dynamics. The reason to reach for the coefficient rather than the gain is that the gain has a floor and a ceiling and the coefficient effectively does not." },
+      { h: "Scaling both inputs is the same as scaling the error", p: "The block subtracts one from the other, and multiplying both by the same number multiplies the difference by that number: four times the setpoint minus four times the measurement is four times the error. So scaling the two inputs separately, scaling the error, and multiplying the gain all produce an identical loop. There is no extra magic and no hidden dynamics. The reason to reach for the coefficient rather than the gain is that the gain has a floor and a ceiling and the coefficient effectively does not." },
+      { h: "Where it stops being identical", p: "As long as the block only uses the difference, the three are interchangeable. It diverges the moment anything works on an absolute value instead: a neutral zone or deadband set in engineering units, an output limit tied to the measurement, a startup ramp, or a graphic reading the block's setpoint. Those all see the scaled number, not the real one." },
       { h: "It scales integral action too", p: "The integral term is built from the same scaled error, so it moves with the coefficient automatically. Tn keeps its meaning in seconds and does not need adjusting when you change the coefficient. That is what makes this workaround clean rather than a bodge." },
       { h: "What to watch out for", p: "The scaled error is not the real error. Anything else that reads that value — a graphic, an alarm limit, a trend log, the next technician — is now looking at a number that is not in engineering units. Label it. Also keep an eye on the scaled value's own limits: multiply a large error by a large coefficient and you can run into the block's internal range before the loop ever saturates the valve." },
       { h: "The cleaner alternative", p: "Where the controller allows it, normalising the measurement to a percentage of a sensible span does the same job and leaves everything downstream readable. The coefficient is what you use when you cannot do that, which in practice is often." },
@@ -614,15 +615,14 @@ const SIEMENS_DEFAULT = { k: 4, tn: 120, ec: 1 };
 // ti of 0 means integral action is switched off.
 function resolve(g, l, mode) {
   const ec = g.ec == null ? 1 : g.ec;
+  // k  = the number on the dial, applied to the scaled error
+  // kp = effective gain in engineering units (k x ec), for display and analysis
   if (mode === "siemens") {
-    return { kp: Math.max(1e-9, g.k) * ec, ti: g.tn > 0 ? g.tn : 0, td: 0, ec };
+    const k = Math.max(1e-9, g.k);
+    return { k, kp: k * ec, ti: g.tn > 0 ? g.tn : 0, td: 0, ec };
   }
-  return {
-    kp: (100 / Math.max(1e-6, g.pb)) * ec,
-    ti: g.ti >= l.ctrl.ti[1] ? 0 : g.ti,
-    td: g.td,
-    ec,
-  };
+  const k = 100 / Math.max(1e-6, g.pb);
+  return { k, kp: k * ec, ti: g.ti >= l.ctrl.ti[1] ? 0 : g.ti, td: g.td, ec };
 }
 
 // Smallest sane coefficient that puts a required gain on the dial.
@@ -732,11 +732,19 @@ function step(s, l, g, dt, mode) {
     const fa = T / (T + filt);
     s.pvf += fa * (s.pv - s.pvf);
 
-    const kp = R.kp;
-    const err = sense * (s.pvf - s.sp);
+    // ABT applies the coefficient to the setpoint and the measurement
+    // separately, before either reaches the block. The block then works
+    // entirely in scaled units.
+    const spBlock = R.ec * s.sp;
+    const pvBlock = R.ec * s.pvf;
+    s.spBlock = spBlock;
+    s.pvBlock = pvBlock;
+
+    const kp = R.k;
+    const err = sense * (pvBlock - spBlock);
     const P = kp * err;
 
-    const dpv = (sense * (s.pvf - s.prevPV)) / T;
+    const dpv = (sense * (pvBlock - R.ec * s.prevPV)) / T;
     const a = T / (T + Math.max(0.5, R.td / 8));
     s.dFilt += a * (dpv - s.dFilt);
     const D = R.td > 0 ? kp * R.td * s.dFilt : 0;
@@ -1282,7 +1290,7 @@ function EcKnob({ value, set, help, l, g }) {
             Error coefficient<HelpDot onClick={help} label="the error coefficient" />
           </div>
           <div style={{ fontSize: 11, color: C.label, lineHeight: 1.35 }}>
-            Error is multiplied by this before the block sees it. Gain × coefficient = {eff} %/{l.io.unit}.
+            Setpoint and measurement are both multiplied by this before the block sees them. Gain × coefficient = {eff} %/{l.io.unit}.
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
