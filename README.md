@@ -17,6 +17,10 @@ Two controller flavours: **Generic** (proportional band, integral time,
 derivative time) and **Siemens** (gain and Tn only, with an error coefficient
 for loops whose required gain falls off the end of the dial).
 
+Responsive: a single column on phones, and a two-column layout above 900px with
+the trend on the left and the controls on the right, so the chart stays in view
+while you adjust.
+
 ---
 
 ## Quick start, locally
@@ -180,16 +184,21 @@ usually the better trade.
 ## Layout
 
 ```
-src/PidTrainer.jsx      the whole trainer — simulation, analyzer, UI
-src/main.jsx            mount point, bundles the fonts
-test/smoke.mjs          headless render + interaction test
-Dockerfile              node build stage, nginx serve stage
-nginx.conf              SPA fallback, cache headers, /healthz
-docker-compose.yml      local: builds from source
-docker-compose.prod.yml server: pulls the published image
-deploy.sh               pull, restart, verify health
-.env.example            copy to .env on the server
+src/PidTrainer.jsx        the trainer — simulation, analyzer, challenges, UI
+src/main.jsx              mount point, bundles the fonts
+server/index.js           serves the frontend and the leaderboard API
+test/smoke.mjs            headless render + interaction test
+test/api.test.mjs         leaderboard API over real HTTP
+test/challenge.test.mjs   challenge and admin flow, end to end
+Dockerfile                build stage, then node runtime
+docker-compose.yml        local: builds from source
+docker-compose.prod.yml   server: pulls the published image
+deploy.sh                 pull, restart, verify health
+.env.example              copy to .env on the server
 ```
+
+Run everything with `npm run test:all`. CI runs all three before publishing an
+image, so a broken build never reaches the server.
 
 ### Notes
 
@@ -207,13 +216,40 @@ sheets. It is the CI gate before an image is published.
 
 ---
 
+## Challenges and the leaderboard
+
+Four fixed challenges, each with its own board. A challenge is identical for
+everyone — same loop, same starting gains, same setpoint move, same disturbance,
+no randomisation — because times are only comparable if the run is. Times are
+not compared across challenges, since a duct static loop settles in seconds and
+a thermal loop takes minutes.
+
+A run needs two verified recoveries: settle after the setpoint step, then hold
+through a load change. The clock runs at 1x only. Pausing is allowed and stops
+the clock, so the board measures how efficiently you tune rather than how fast
+you think.
+
+One time per person per challenge. Submitting a better time replaces the old
+one; a slower time leaves the board unchanged. Names match case-insensitively,
+so `david` and `David` are the same person.
+
+### Admin
+
+Click any row on the leaderboard, enter the PIN, then rename or delete it.
+The PIN is `ADMIN_PIN` in the server environment — change it in `.env` and
+restart, no rebuild. Leave it empty to disable editing completely. Renaming an
+entry onto a name that already has a time merges them and keeps the better one.
+
+The check happens server-side. A PIN checked in the browser would sit in the
+JavaScript bundle for anyone to read.
+
+### What the leaderboard does not do
+
+The simulation runs in the browser, so a submitted time is a claim, not a proof.
+The server rejects implausible values but cannot tell a real run from a crafted
+POST. Fine among colleagues; worth knowing before anything rides on it. Making
+it verifiable means replaying the submitted gain changes server-side.
+
 ## Still to come
 
-Sign-in and a shared leaderboard for competition mode. That needs an API and a
-database — `docker-compose.prod.yml` has a commented sketch of the services, and
-`nginx.conf` already does SPA fallback so client-side routes will work.
-
-Worth deciding early: for a fair leaderboard the timed mode should use a seeded
-random generator so everyone races the identical process and fault, and scores
-should be verified server-side. As it stands the simulation runs entirely in the
-browser, where a submitted time can't be trusted.
+Accounts, if the honour system stops being enough.

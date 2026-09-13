@@ -26,6 +26,8 @@ jobs:
       # Renders the app headlessly and clicks through it. Catches runtime
       # breakage that a successful build will happily hide.
       - run: npm test
+      - run: npm run test:api
+      - run: npm run test:challenge
 
   publish:
     needs: test

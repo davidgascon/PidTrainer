@@ -389,6 +389,106 @@ function makeCall() {
   };
 }
 
+
+/* ============================================================
+   CHALLENGE MODE
+
+   A challenge has to be identical for everyone or the leaderboard means
+   nothing, so these are fixed: fixed loop, fixed starting gains, fixed
+   setpoint step, fixed disturbance. No scrambling, no randomness.
+
+   Each challenge has its own board. Times are not comparable across loops
+   — a duct static loop settles in seconds, a chiller takes minutes — so
+   ranking them together would be meaningless.
+
+   Only fast loops are used. The clock runs at 1x in challenge mode, so a
+   slow thermal loop would mean a twenty minute sitting.
+   ============================================================ */
+
+const CHALLENGES = [
+  {
+    id: "duct-static",
+    title: "Duct static hunting",
+    blurb: "Supply fan surging on a duct static loop. Settle it, then hold it through a load change.",
+    loop: "static",
+    start: { pb: 0.5, ti: 15, td: 0 },
+    step: 0.4,        // setpoint move, in engineering units
+    event: 0,         // index into the loop's event list
+  },
+  {
+    id: "chw-dp",
+    title: "Pump differential pressure",
+    blurb: "Chilled water pump speed oscillating on a noisy DP transmitter.",
+    loop: "dp",
+    start: { pb: 5.5, ti: 10, td: 0 },
+    step: 2,
+    event: 0,
+  },
+  {
+    id: "vav-flow",
+    title: "Box airflow, slow damper",
+    blurb: "Noisy flow signal, ninety second damper. Two very different speeds in one loop.",
+    loop: "cfm",
+    start: { pb: 300, ti: 20, td: 0 },
+    step: 250,
+    event: 0,
+  },
+  {
+    id: "dhw-temp",
+    title: "Domestic hot water",
+    blurb: "Tempering valve swinging on a fast process. Overshoot here is a scalding complaint.",
+    loop: "dhw",
+    start: { pb: 12, ti: 30, td: 0 },
+    step: 5,
+    event: 0,
+  },
+];
+
+const API = {
+  async board(challenge) {
+    const r = await fetch(`/api/board?challenge=${encodeURIComponent(challenge)}`);
+    if (!r.ok) throw new Error("could not load the leaderboard");
+    return (await r.json()).scores;
+  },
+  async submit(challenge, name, seconds) {
+    const r = await fetch("/api/score", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ challenge, name, seconds }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || "could not submit");
+    return body;
+  },
+  async checkPin(pin) {
+    const r = await fetch("/api/admin/check", {
+      method: "POST", headers: { "content-type": "application/json", "x-admin-pin": pin },
+      body: "{}",
+    });
+    return r.ok;
+  },
+  async edit(id, pin, patch) {
+    const r = await fetch(`/api/score/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-admin-pin": pin },
+      body: JSON.stringify(patch),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || "could not save");
+    return body;
+  },
+  async remove(id, pin) {
+    const r = await fetch(`/api/score/${id}`, {
+      method: "DELETE", headers: { "x-admin-pin": pin },
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || "could not delete");
+    return body;
+  },
+};
+
+const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
 /* ============================================================
    HELP CONTENT
    ============================================================ */
@@ -506,6 +606,10 @@ const EC_STEPS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
 // A real controller's ranges are fixed by the product, not by the loop.
 const SIEMENS = { k: [0.1, 50, 0.1], tn: [0, 3000, 5] };
 
+// Where the Siemens flavour starts: gain 4, Tn 2 minutes, coefficient 1.
+// A sane field default to adapt from, not a tune for any particular loop.
+const SIEMENS_DEFAULT = { k: 4, tn: 120, ec: 1 };
+
 // Resolved gains the simulation actually runs on.
 // ti of 0 means integral action is switched off.
 function resolve(g, l, mode) {
@@ -534,12 +638,7 @@ const pickEc = (kp) => {
 function convert(g, l, from, to) {
   if (from === to) return g;
   const R = resolve(g, l, from);
-  if (to === "siemens") {
-    // The coefficient starts at 1 and stays where the user put it. If the
-    // gain the loop needs falls off the dial, that's the lesson, not a bug.
-    const ec = g.ec == null ? 1 : g.ec;
-    return { ...g, ec, k: snap(R.kp / ec, SIEMENS.k), tn: R.ti > 0 ? snap(R.ti, SIEMENS.tn) : 0 };
-  }
+  if (to === "siemens") return { ...g, ...SIEMENS_DEFAULT };
   return {
     ...g, ec: 1,
     pb: snap(100 / Math.max(1e-6, R.kp), l.ctrl.pb),
@@ -718,6 +817,15 @@ function rollStep(s, l) {
     t: s.t,
     text: `Setpoint moved ${fmt(from, l)} → ${fmt(next, l)} ${l.io.unit} (${d > 0 ? "+" : ""}${fmt(d, l)})`,
   };
+  return s.event;
+}
+
+// Same disturbance every time, for challenge runs.
+function rollEventFixed(s, l, idx) {
+  const e = l.events[idx % l.events.length];
+  s.baseTarget = s.base + e.d;
+  s.stepAt = s.t; s.inBand = 0; s.verified = null; s.worst = 0;
+  s.event = { t: s.t, text: e.text };
   return s.event;
 }
 
@@ -1098,6 +1206,44 @@ function Readout({ label, value, unit, color, big }) {
   );
 }
 
+/* Editable readout. Tap the number and type it — the sliders are fine for
+   exploring, but once you know you want 22.5 you want to just say so. */
+function ValueField({ value, display, unit, onCommit, width = 68 }) {
+  const [draft, setDraft] = useState(null);
+  const editing = draft !== null;
+
+  const commit = () => {
+    const n = parseFloat(String(draft).replace(/[^0-9.eE+-]/g, ""));
+    if (Number.isFinite(n)) onCommit(n);
+    setDraft(null);
+  };
+
+  return (
+    <span style={{ display: "inline-flex", alignItems: "baseline", flexShrink: 0 }}>
+      <input
+        type="text"
+        inputMode="decimal"
+        value={editing ? draft : display}
+        aria-label={`${unit ? unit + " " : ""}value, editable`}
+        onFocus={(e) => { setDraft(String(value)); setTimeout(() => e.target.select(), 0); }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+          if (e.key === "Escape") { setDraft(null); e.currentTarget.blur(); }
+        }}
+        style={{
+          width, textAlign: "right", fontFamily: FONT_D, fontSize: 21, fontWeight: 600,
+          color: C.ink, background: editing ? "#fff" : "transparent",
+          border: "none", borderBottom: `1px dashed ${editing ? C.chw : C.bezelLight}`,
+          borderRadius: 2, padding: "1px 3px", fontVariantNumeric: "tabular-nums",
+        }}
+      />
+      {unit ? <span style={{ fontSize: 10.5, color: C.label, marginLeft: 2 }}>{unit}</span> : null}
+    </span>
+  );
+}
+
 function Knob({ label, hint, value, set, range, fmt: f, unit, help }) {
   const [lo, hi, st] = range;
   const nudge = (d) => set(snap(value + d * st, range));
@@ -1112,13 +1258,12 @@ function Knob({ label, hint, value, set, range, fmt: f, unit, help }) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
           <button onClick={() => nudge(-1)} style={btnSm}>−</button>
-          <span style={{ fontFamily: FONT_D, fontSize: 21, fontWeight: 600, minWidth: 66, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-            {f(value)}<span style={{ fontSize: 10.5, color: C.label, marginLeft: 2 }}>{unit}</span>
-          </span>
+          <ValueField value={value} display={f(value)} unit={unit}
+            onCommit={(n) => set(snap(n, range))} />
           <button onClick={() => nudge(1)} style={btnSm}>+</button>
         </div>
       </div>
-      <input type="range" min={lo} max={hi} step={st} value={value} aria-label={label}
+      <input type="range" min={lo} max={hi} step={st} value={value ?? lo} aria-label={label}
         onChange={(e) => set(parseFloat(e.target.value))}
         style={{ width: "100%", marginTop: 8, accentColor: C.chw }} />
     </div>
@@ -1127,7 +1272,7 @@ function Knob({ label, hint, value, set, range, fmt: f, unit, help }) {
 
 
 function EcKnob({ value, set, help, l, g }) {
-  const i = Math.max(0, EC_STEPS.indexOf(value));
+  const i = Math.max(0, EC_STEPS.indexOf(value ?? 1));
   const eff = round(g.k * value);
   return (
     <div style={{ padding: "10px 0", borderTop: `1px solid ${C.chassisDark}` }}>
@@ -1142,9 +1287,13 @@ function EcKnob({ value, set, help, l, g }) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
           <button onClick={() => set(EC_STEPS[Math.max(0, i - 1)])} style={btnSm}>−</button>
-          <span style={{ fontFamily: FONT_D, fontSize: 21, fontWeight: 600, minWidth: 66, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-            {value}<span style={{ fontSize: 10.5, color: C.label, marginLeft: 2 }}>×</span>
-          </span>
+          <ValueField value={value} display={String(value)} unit="×"
+            onCommit={(n) => {
+              // snap a typed coefficient to the nearest preset, in log space
+              const t = clamp(Math.abs(n) || 1, EC_STEPS[0], EC_STEPS[EC_STEPS.length - 1]);
+              set(EC_STEPS.reduce((b, v) =>
+                Math.abs(Math.log10(v / t)) < Math.abs(Math.log10(b / t)) ? v : b, EC_STEPS[0]));
+            }} />
           <button onClick={() => set(EC_STEPS[Math.min(EC_STEPS.length - 1, i + 1)])} style={btnSm}>+</button>
         </div>
       </div>
@@ -1153,6 +1302,34 @@ function EcKnob({ value, set, help, l, g }) {
         style={{ width: "100%", marginTop: 8, accentColor: C.chw }} />
     </div>
   );
+}
+
+/* Live count of people using the trainer right now. Renders nothing if the
+   presence endpoint is unreachable, so a dist-only deploy still works. */
+function ActiveCount() {
+  const [n, setN] = useState(null);
+  useEffect(() => {
+    const id = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `s-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    let alive = true;
+    const beat = async () => {
+      try {
+        const r = await fetch(`/api/presence?id=${id}`, { cache: "no-store" });
+        if (!r.ok) throw new Error("unavailable");
+        const d = await r.json();
+        if (alive) setN(typeof d.count === "number" ? d.count : null);
+      } catch {
+        if (alive) setN(null);
+      }
+    };
+    beat();
+    const t = setInterval(beat, 20_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  if (!n || n < 1) return null;
+  return <span style={{ opacity: 0.75 }}> · {n} active</span>;
 }
 
 function Modal({ children, onClose, wide }) {
@@ -1207,6 +1384,220 @@ function HelpSheet({ topic, typical, onClose }) {
   );
 }
 
+
+
+const sheet = `
+  button:focus-visible, input:focus-visible { outline: 2px solid ${C.chw}; outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  .lab-shell { max-width: 620px; margin: 0 auto; }
+  .lab-grid { display: block; }
+  @media (min-width: 900px) {
+    .lab-shell { max-width: 1180px; }
+    .lab-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .lab-col > *:first-child { margin-top: 0 !important; }
+    .lab-col-right { position: sticky; top: 12px; }
+  }
+  @media (min-width: 1400px) { .lab-shell { max-width: 1320px; } }
+`;
+
+function Nav({ view, setView, chal, onExit }) {
+  const tab = (active) => ({
+    flex: 1, padding: "9px 10px", borderRadius: 4, cursor: "pointer",
+    border: `1px solid ${active ? C.bezel : C.bezelLight}`,
+    background: active ? C.bezel : "transparent",
+    color: active ? C.paper : C.ink,
+    fontFamily: FONT_D, fontSize: 15.5, fontWeight: 600, letterSpacing: 0.3,
+  });
+  return (
+    <div className="lab-shell" style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+      <button onClick={() => { if (chal) onExit(); setView("train"); }} style={tab(view === "train" && !chal)}>
+        Train
+      </button>
+      <button onClick={() => setView("board")} style={tab(view === "board" || !!chal)}>
+        Challenges
+      </button>
+    </div>
+  );
+}
+
+/* ============================================================
+   LEADERBOARD
+   ============================================================ */
+
+function Leaderboard({ initial, onPlay }) {
+  const [cid, setCid] = useState(initial || CHALLENGES[0].id);
+  const [scores, setScores] = useState(null);
+  const [err, setErr] = useState(null);
+  const [pin, setPin] = useState("");        // held only while the tab is open
+  const [pinDraft, setPinDraft] = useState("");
+  const [target, setTarget] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const ch = CHALLENGES.find((c) => c.id === cid);
+
+  const load = useCallback(async (id) => {
+    setScores(null); setErr(null);
+    try { setScores(await API.board(id)); }
+    catch (e) { setErr(e.message); }
+  }, []);
+
+  useEffect(() => { load(cid); }, [cid, load]);
+
+  const openAdmin = async (row) => {
+    setTarget(row); setDraft(row.name); setErr(null);
+    if (pin && !(await API.checkPin(pin))) setPin("");
+  };
+
+  const unlock = async (candidate) => {
+    setBusy(true);
+    try {
+      if (await API.checkPin(candidate)) { setPin(candidate); setErr(null); setPinDraft(""); }
+      else setErr("That PIN was not accepted.");
+    } catch { setErr("Could not reach the server."); }
+    setBusy(false);
+  };
+
+  const doEdit = async () => {
+    setBusy(true);
+    try { const r = await API.edit(target.id, pin, { name: draft }); setScores(r.scores); setTarget(null); }
+    catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const doDelete = async () => {
+    setBusy(true);
+    try { const r = await API.remove(target.id, pin); setScores(r.scores); setTarget(null); }
+    catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const card = { background: C.chassis, border: `1px solid ${C.chassisDark}`, borderRadius: 5, padding: 14, marginTop: 10 };
+
+  return (
+    <div className="lab-shell">
+      <div style={{ background: C.bezel, borderRadius: 5, padding: "12px 14px" }}>
+        <div style={{ fontFamily: FONT_D, fontSize: 12.5, color: C.gridBold, letterSpacing: 1.6, fontWeight: 600 }}>LEADERBOARD</div>
+        <div style={{ fontFamily: FONT_D, fontSize: 25, fontWeight: 700, color: C.paper, lineHeight: 1.05 }}>{ch.title}</div>
+        <div style={{ fontSize: 12.5, color: C.chassisDark, marginTop: 3, lineHeight: 1.45 }}>{ch.blurb}</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+        {CHALLENGES.map((c) => (
+          <button key={c.id} onClick={() => setCid(c.id)}
+            style={{
+              flex: "1 1 auto", padding: "8px 10px", borderRadius: 4, cursor: "pointer",
+              border: `1px solid ${c.id === cid ? C.bezel : C.bezelLight}`,
+              background: c.id === cid ? C.bezel : "transparent",
+              color: c.id === cid ? C.paper : C.ink,
+              fontFamily: FONT_D, fontSize: 14.5, fontWeight: 600,
+            }}>{c.title}</button>
+        ))}
+      </div>
+
+      <div style={card}>
+        {scores == null && !err && <div style={{ fontSize: 13, color: C.label }}>Loading…</div>}
+        {err && !target && (
+          <div style={{ fontSize: 13, color: C.fault, lineHeight: 1.5 }}>
+            {err}
+            <button onClick={() => load(cid)} style={{ ...btn(false), marginLeft: 10, padding: "4px 10px", fontSize: 13 }}>Retry</button>
+          </div>
+        )}
+        {scores && scores.length === 0 && (
+          <div style={{ fontSize: 13.5, color: C.label, lineHeight: 1.55 }}>
+            Nobody has posted a time on this one yet. Whoever goes first sets the bar.
+          </div>
+        )}
+        {scores && scores.length > 0 && (
+          <div>
+            {scores.map((row) => (
+              <button key={row.id} onClick={() => openAdmin(row)}
+                title="Admin: edit or remove"
+                style={{
+                  display: "flex", width: "100%", alignItems: "center", gap: 10,
+                  padding: "9px 6px", background: "transparent", cursor: "pointer",
+                  border: "none", borderBottom: `1px solid ${C.chassisDark}`,
+                  fontFamily: FONT_B, textAlign: "left", color: C.ink,
+                }}>
+                <span style={{
+                  fontFamily: FONT_D, fontSize: 19, fontWeight: 700, minWidth: 30,
+                  color: row.rank === 1 ? C.amber : C.label,
+                }}>{row.rank}</span>
+                <span style={{ fontFamily: FONT_D, fontSize: 19, fontWeight: 600, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {row.name}
+                </span>
+                <span style={{ fontFamily: FONT_D, fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                  {mmss(row.seconds)}
+                </span>
+              </button>
+            ))}
+            <div style={{ fontSize: 11, color: C.label, paddingTop: 9 }}>
+              One time per person per challenge — a better run replaces the old one.
+            </div>
+          </div>
+        )}
+      </div>
+
+      <button onClick={() => onPlay(cid)} style={{ ...btn(true), width: "100%", marginTop: 10, padding: "12px 14px", fontSize: 18 }}>
+        Run this challenge
+      </button>
+
+      <div style={{ textAlign: "center", fontSize: 11, color: C.label, padding: "14px 0 6px" }}>Loop Lab · leaderboard</div>
+
+      {target && (
+        <Modal onClose={() => { setTarget(null); setErr(null); }}>
+          <div style={{ background: C.bezel, color: C.paper, padding: "14px 16px" }}>
+            <div style={{ fontFamily: FONT_D, fontSize: 12.5, letterSpacing: 1.4, opacity: 0.8, fontWeight: 600 }}>ENTRY</div>
+            <div style={{ fontFamily: FONT_D, fontSize: 24, fontWeight: 700 }}>{target.name} — {mmss(target.seconds)}</div>
+          </div>
+          <div style={{ padding: 16 }}>
+            {!pin ? (
+              <>
+                <p style={{ fontSize: 13.5, lineHeight: 1.55, margin: "0 0 12px" }}>
+                  Editing and removing entries needs the admin PIN.
+                </p>
+                <input
+                  id="pinbox" type="password" inputMode="numeric" autoComplete="off" placeholder="PIN"
+                  value={pinDraft}
+                  onChange={(e) => setPinDraft(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") unlock(pinDraft); }}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: 18, fontFamily: FONT_D, borderRadius: 4, border: `1px solid ${C.bezelLight}`, background: C.paper, color: C.ink }}
+                />
+                {err && <div style={{ color: C.fault, fontSize: 12.5, marginTop: 8 }}>{err}</div>}
+                <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                  <button disabled={busy} onClick={() => unlock(pinDraft)}
+                    style={{ ...btn(true), flex: 1 }}>Unlock</button>
+                  <button onClick={() => { setTarget(null); setErr(null); }} style={btn(false)}>Cancel</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <label style={{ fontSize: 11.5, color: C.label }}>Name</label>
+                <input value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={20}
+                  style={{ width: "100%", padding: "10px 12px", fontSize: 18, fontFamily: FONT_D, borderRadius: 4, border: `1px solid ${C.bezelLight}`, background: C.paper, color: C.ink, marginTop: 4 }} />
+                {err && <div style={{ color: C.fault, fontSize: 12.5, marginTop: 8 }}>{err}</div>}
+                <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+                  <button disabled={busy || !draft.trim()} onClick={doEdit} style={{ ...btn(true), flex: 1 }}>Save name</button>
+                  <button disabled={busy} onClick={doDelete}
+                    style={{ ...btn(false), borderColor: C.fault, color: C.fault }}>Delete entry</button>
+                  <button onClick={() => { setTarget(null); setErr(null); }} style={btn(false)}>Cancel</button>
+                </div>
+                <div style={{ fontSize: 11, color: C.label, marginTop: 10, lineHeight: 1.45 }}>
+                  Renaming onto a name that already has a time merges the two and keeps the better one.
+                </div>
+              </>
+            )}
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -1224,18 +1615,68 @@ export default function App() {
   const [picker, setPicker] = useState(false);
   const [hints, setHints] = useState(0);
   const [debrief, setDebrief] = useState(null);
+  const [view, setView] = useState("train");        // train | board
+  const [chal, setChal] = useState(null);           // active challenge definition
+  const [result, setResult] = useState(null);       // finished run awaiting a name
+  const [name, setName] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [postErr, setPostErr] = useState(null);
+  const [posted, setPosted] = useState(null);
 
   const sim = useRef(makeSim(L[0]));
-  const R = useRef({ g, run, speed, l, mode });
-  R.current = { g, run, speed, l, mode };
+  const R = useRef({});
+  R.current = {
+    g, run, speed, l, mode, chal,
+    finish: (secs) => { setRun(false); setResult({ seconds: secs, challenge: chal }); },
+  };
 
   const load = useCallback((nl, m) => {
     sim.current = makeSim(nl);
     setL(nl);
-    setG(convert({ ...nl.start, ec: 1 }, nl, "generic", m || "generic"));
+    setG(m === "siemens" ? { ...nl.start, ...SIEMENS_DEFAULT } : { ...nl.start, ec: 1 });
     setSpeed(nl.speed); setSpan(nl.spans[0]);
     setDiag(null); setDebrief(null); setHints(0); setRun(true);
   }, []);
+
+  // A challenge is deterministic: same loop, same starting gains, same
+  // setpoint move for everyone. The disturbance fires automatically once the
+  // first recovery is verified, so the run needs no further setup.
+  const startChallenge = useCallback((id) => {
+    const c = CHALLENGES.find((x) => x.id === id) || CHALLENGES[0];
+    const base = L.find((x) => x.id === c.loop);
+    const lesson = { ...base, start: c.start, challenge: c.id };
+    sim.current = makeSim(lesson);
+    setL(lesson);
+    setG(convert({ ...c.start, ec: 1 }, lesson, "generic", R.current.mode));
+    setSpan(lesson.spans[0]);
+    setSpeed(1);                       // challenges run in real time
+    setChal(c); setView("train"); setResult(null); setPosted(null);
+    setPostErr(null); setName(""); setDiag(null); setDebrief(null); setHints(0);
+    setRun(true);
+
+    // fire the opening setpoint move immediately so the clock starts honestly
+    const s0 = sim.current;
+    const [lo, hi] = lesson.sp.range;
+    s0.sp = clamp(lesson.sp.init + c.step, lo, hi);
+    s0.stepAt = 0; s0.inBand = 0; s0.verified = null; s0.worst = 0;
+    s0.event = { t: 0, text: `Challenge started — setpoint moved to ${fmt(s0.sp, lesson)} ${lesson.io.unit}` };
+  }, []);
+
+  const submitScore = async () => {
+    if (!result || !name.trim()) return;
+    setPosting(true); setPostErr(null);
+    try {
+      setPosted(await API.submit(result.challenge.id, name.trim(), result.seconds));
+    } catch (e) {
+      setPostErr(e.message + ". Your time is still on screen — try again.");
+    }
+    setPosting(false);
+  };
+
+  const exitChallenge = useCallback(() => {
+    setChal(null); setResult(null); setPosted(null); setPostErr(null);
+    load(L[0], R.current.mode);
+  }, [load]);
 
   // Switching flavour keeps the loop behaving exactly as it was.
   // Read mode/l from render scope, not from the ref: StrictMode invokes
@@ -1260,6 +1701,20 @@ export default function App() {
         while (acc >= DT && n < 6000) { step(sim.current, ll, gg, DT, mm); acc -= DT; n++; }
         if (acc > DT) acc = 0;
       }
+      // challenge script: first recovery verified -> throw the disturbance;
+      // second recovery verified -> the run is over
+      const cc = R.current.chal;
+      if (cc) {
+        const s = sim.current;
+        if (s.passes === 1 && !s.stage2) {
+          s.stage2 = true;
+          rollEventFixed(s, R.current.l, cc.event);
+        } else if (s.passes >= 2 && !s.done) {
+          s.done = true;
+          R.current.finish(Math.round(s.t));
+        }
+      }
+
       ui += real;
       if (ui > 0.06) {
         ui = 0;
@@ -1279,35 +1734,21 @@ export default function App() {
 
   const groups = [...new Set(L.map((x) => x.group))];
 
+  if (view === "board") {
+    return (
+      <div style={{ background: C.chassis, minHeight: "100vh", padding: 12, fontFamily: FONT_B, color: C.ink }}>
+        <style>{sheet}</style>
+        <Nav view={view} setView={setView} chal={chal} onExit={exitChallenge} />
+        <Leaderboard initial={chal?.id} onPlay={(id) => startChallenge(id)} />
+      </div>
+    );
+  }
+
   return (
     <div style={{ background: C.chassis, minHeight: "100vh", padding: 12, fontFamily: FONT_B, color: C.ink }}>
       <div className="lab-shell">
-      <style>{`
-        button:focus-visible, input:focus-visible { outline: 2px solid ${C.chw}; outline-offset: 2px; }
-        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
-
-        /* Phone first: one column, nothing to do. */
-        .lab-shell { max-width: 620px; margin: 0 auto; }
-        .lab-grid { display: block; }
-
-        /* Desktop: trend and readouts on the left, the things you touch on
-           the right, so the chart stays visible while you adjust. */
-        @media (min-width: 900px) {
-          .lab-shell { max-width: 1180px; }
-          .lab-grid {
-            display: grid;
-            grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
-            gap: 12px;
-            align-items: start;
-          }
-          .lab-col > *:first-child { margin-top: 0 !important; }
-          .lab-col-right { position: sticky; top: 12px; }
-        }
-
-        @media (min-width: 1400px) {
-          .lab-shell { max-width: 1320px; }
-        }
-      `}</style>
+        <Nav view={view} setView={setView} chal={chal} onExit={exitChallenge} />
+      <style>{sheet}</style>
 
       <div style={{ background: C.bezel, borderRadius: "5px 5px 0 0", padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10 }}>
         <div style={{ minWidth: 0 }}>
@@ -1318,11 +1759,25 @@ export default function App() {
             {l.blind ? "Fault unknown" : l.name}
           </div>
         </div>
-        <button onClick={() => setPicker(true)} style={{ ...btn(false), color: C.paper, borderColor: C.bezelLight, padding: "7px 11px", fontSize: 14, flexShrink: 0 }}>Change loop</button>
+        {!chal && <button onClick={() => setPicker(true)} style={{ ...btn(false), color: C.paper, borderColor: C.bezelLight, padding: "7px 11px", fontSize: 14, flexShrink: 0 }}>Change loop</button>}
       </div>
       <div style={{ background: C.bezelLight, padding: "9px 14px", color: C.paper, fontSize: 12.5, lineHeight: 1.5, borderBottom: `4px solid ${C.bezel}` }}>
         {l.blind ? l.complaint : l.brief}
       </div>
+      {chal && (
+        <div style={{ background: C.bezelLight, color: C.paper, padding: "9px 14px", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", borderBottom: `4px solid ${C.bezel}`, marginTop: -4 }}>
+          <span style={{ fontFamily: FONT_D, fontSize: 21, fontWeight: 700, fontVariantNumeric: "tabular-nums", color: result ? C.ok : C.paper }}>
+            {mmss(v.t)}
+          </span>
+          <span style={{ fontSize: 12.5 }}>
+            {v.passes >= 2 ? "Run complete" : v.passes === 1 ? "Recovered once — now ride out the load change" : "Settle it, then hold it through a disturbance"}
+          </span>
+          <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15 }}>
+            {Math.min(v.passes, 2)} of 2
+          </span>
+        </div>
+      )}
+
       {l.blind && (
         <div style={{ background: C.amber, color: "#241a05", padding: "8px 14px", fontSize: 12.5, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", borderBottom: `4px solid ${C.bezel}`, marginTop: -4 }}>
           <span style={{ fontFamily: FONT_D, fontSize: 16, fontWeight: 700 }}>
@@ -1373,6 +1828,49 @@ export default function App() {
         </div>
       )}
 
+      {result && (
+        <div style={{ ...card, borderColor: C.ok, borderWidth: 2 }}>
+          <div style={{ fontFamily: FONT_D, fontSize: 26, fontWeight: 700, color: C.ok }}>
+            Finished in {mmss(result.seconds)}
+          </div>
+          <div style={{ fontSize: 12.5, color: C.label, lineHeight: 1.5, marginTop: 2 }}>
+            Two recoveries verified on {result.challenge.title}. Put a name to it and it goes on the board.
+          </div>
+          {posted ? (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>
+                {posted.improved
+                  ? `Posted${posted.rank ? ` at number ${posted.rank}` : ""}.`
+                  : posted.message || "Your existing time on this challenge was better, so the board is unchanged."}
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                <button onClick={() => setView("board")} style={{ ...btn(true), flex: 1 }}>See the board</button>
+                <button onClick={() => startChallenge(result.challenge.id)} style={btn(false)}>Run it again</button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ marginTop: 12 }}>
+              <input
+                value={name} onChange={(e) => setName(e.target.value)} maxLength={20}
+                placeholder="Your name"
+                onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) submitScore(); }}
+                style={{ width: "100%", padding: "10px 12px", fontSize: 18, fontFamily: FONT_D, borderRadius: 4, border: `1px solid ${C.bezelLight}`, background: C.paper, color: C.ink }}
+              />
+              {postErr && <div style={{ color: C.fault, fontSize: 12.5, marginTop: 8 }}>{postErr}</div>}
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                <button disabled={posting || !name.trim()} onClick={submitScore} style={{ ...btn(true), flex: 1 }}>
+                  {posting ? "Posting…" : "Post my time"}
+                </button>
+                <button onClick={() => startChallenge(result.challenge.id)} style={btn(false)}>Run it again</button>
+              </div>
+              <div style={{ fontSize: 11, color: C.label, marginTop: 9, lineHeight: 1.45 }}>
+                Reusing a name replaces that person's previous time, but only if this run was faster.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {v.verified != null && (
         <div style={{ marginTop: 8, padding: 14, borderRadius: 5, background: C.ok, color: "#fff" }}>
           <div style={{ fontFamily: FONT_D, fontSize: 22, fontWeight: 700 }}>Settled in {Math.round(v.verified)} s</div>
@@ -1396,15 +1894,16 @@ export default function App() {
             Sign off on this loop
           </button>
         )}
-        <button onClick={() => rollStep(sim.current, l)} style={{ ...btn(false), flex: "1 1 46%" }}>New setpoint</button>
-        <button onClick={() => rollEvent(sim.current, l)} style={{ ...btn(false), flex: "1 1 46%" }}>Throw a disturbance</button>
+        {!chal && <button onClick={() => rollStep(sim.current, l)} style={{ ...btn(false), flex: "1 1 46%" }}>New setpoint</button>}
+        {!chal && <button onClick={() => rollEvent(sim.current, l)} style={{ ...btn(false), flex: "1 1 46%" }}>Throw a disturbance</button>}
         <button onClick={() => setRun((r) => !r)} style={{ ...btn(false), flex: 1 }}>{run ? "Freeze" : "Run"}</button>
-        <button onClick={() => load(l, mode)} style={{ ...btn(false), flex: 1 }}>Restart</button>
+        <button onClick={() => (chal ? startChallenge(chal.id) : load(l, mode))} style={{ ...btn(false), flex: 1 }}>Restart</button>
         <div style={{ flex: "1 1 100%", display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: C.label, paddingTop: 4 }}>
           <span>Clock</span>
-          {[1, 6, 20, 60].map((s) => (
+          {(chal ? [1] : [1, 6, 20, 60]).map((s) => (
             <button key={s} onClick={() => setSpeed(s)} style={{ ...btnSm, width: "auto", padding: "0 9px", fontSize: 13.5, background: speed === s ? C.bezel : C.chassis, color: speed === s ? C.paper : C.ink }}>{s}×</button>
           ))}
+          {chal && <span style={{ fontSize: 11 }}>real time only · pausing stops the clock</span>}
           <span style={{ marginLeft: "auto", fontVariantNumeric: "tabular-nums" }}>
             {Math.floor(v.t / 60)}:{String(Math.floor(v.t % 60)).padStart(2, "0")}
           </span>
@@ -1437,7 +1936,7 @@ export default function App() {
           <>
             <Knob label="Proportional band" hint={`Error that drives the ${l.io.outShort} 0 to 100%. Wider is gentler.`}
               value={g.pb} set={(x) => setG({ ...g, pb: x })} range={l.ctrl.pb}
-              fmt={(x) => (x < 1 ? x.toFixed(3) : x < 10 ? x.toFixed(1) : x.toFixed(0))} unit={l.io.unit}
+              fmt={(x) => (x < 1 ? x.toFixed(3) : x < 100 ? x.toFixed(1) : x.toFixed(0))} unit={l.io.unit}
               help={() => setHelp("pb")} />
             <Knob label="Integral time" hint={`Seconds to repeat the proportional correction. ${l.ctrl.ti[1]} s switches reset off.`}
               value={g.ti} set={(x) => setG({ ...g, ti: x })} range={l.ctrl.ti}
@@ -1451,7 +1950,7 @@ export default function App() {
           <>
             <Knob label="Gain" hint={`Percent of ${l.io.outShort} per unit of error seen by the block. Higher is more aggressive.`}
               value={g.k} set={(x) => setG({ ...g, k: x })} range={SIEMENS.k}
-              fmt={(x) => (x < 10 ? x.toFixed(1) : x.toFixed(0))} unit="" help={() => setHelp("gain")} />
+              fmt={(x) => x.toFixed(1)} unit="" help={() => setHelp("gain")} />
             <Knob label="Tn" hint="Integral action time in seconds. 0 switches integral action off."
               value={g.tn} set={(x) => setG({ ...g, tn: x })} range={SIEMENS.tn}
               fmt={(x) => (x > 0 ? x.toFixed(0) : "off")} unit={g.tn > 0 ? "s" : ""} help={() => setHelp("tn")} />
@@ -1479,7 +1978,9 @@ export default function App() {
       </div>
       </div>
 
-      <div style={{ textAlign: "center", fontSize: 11, color: C.label, padding: "14px 0 6px" }}>Loop Lab · training mode</div>
+      <div style={{ textAlign: "center", fontSize: 11, color: C.label, padding: "14px 0 6px" }}>
+        Loop Lab · training mode<ActiveCount />
+      </div>
       </div>
 
       {help && (

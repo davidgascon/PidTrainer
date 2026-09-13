@@ -1,24 +1,25 @@
 services:
-  web:
-    # Set IMAGE in .env, e.g. ghcr.io/yourname/loop-lab
-    # Pin TAG to a short sha to roll back: TAG=sha-1a2b3c4
-    image: ${IMAGE:-ghcr.io/CHANGE-ME/loop-lab}:${TAG:-latest}
+  app:
+    image: ${IMAGE:-ghcr.io/CHANGE-ME/pidtrainer}:${TAG:-latest}
     pull_policy: always
     container_name: loop-lab
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-8080}:80"
+      # Bind to localhost so only the reverse proxy can reach it
+      - "127.0.0.1:${HOST_PORT:-8080}:3000"
+    environment:
+      # Change this without rebuilding. Leave empty to disable editing entirely.
+      ADMIN_PIN: "${ADMIN_PIN:?set ADMIN_PIN in .env}"
+    volumes:
+      # Named volume holds leaderboard.json. Without it, scores are lost
+      # every time you redeploy.
+      - looplab-data:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s
-    read_only: true
-    tmpfs:
-      - /tmp
-      - /var/cache/nginx
-      - /var/run
     security_opt:
       - no-new-privileges:true
     logging:
@@ -26,3 +27,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  looplab-data:
