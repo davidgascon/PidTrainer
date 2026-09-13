@@ -30,7 +30,7 @@ const DIST = path.join(__dirname, "..", "dist");
 // the client can't quietly create a phantom board nobody can find.
 const CHALLENGES = [
   "duct-static", "chw-dp", "vav-flow", "dhw-temp",
-  "static-filters", "static-sluggish", "dp-noreset",
+  "static-filters", "static-trip", "dp-noreset",
   "bldg-static", "vav-chatter", "dhw-copied",
 ];
 
@@ -94,7 +94,7 @@ function ranked(challenge) {
   return board.scores
     .filter((s) => s.challenge === challenge)
     .sort((a, b) => a.seconds - b.seconds || a.at - b.at)
-    .map((s, i) => ({ ...s, rank: i + 1 }));
+    .map((s, i) => ({ ...s, rank: i + 1, attempts: s.attempts || 1 }));
 }
 
 // Crude per-IP throttle. Enough to stop an accidental loop hammering the file;
@@ -187,9 +187,12 @@ app.post("/api/score", throttle("score", 60, 60_000), async (req, res) => {
   const existing = board.scores.find((s) => key(s.challenge, s.name) === k);
 
   if (existing) {
+    // Every completed run counts as an attempt, whether or not it was a PB.
+    existing.attempts = (existing.attempts || 1) + 1;
     if (rounded >= existing.seconds) {
+      await save();
       return res.json({
-        improved: false, best: existing.seconds,
+        improved: false, best: existing.seconds, attempts: existing.attempts,
         scores: ranked(challenge),
         message: `Your best on this challenge is still ${existing.seconds}s.`,
       });
@@ -200,7 +203,7 @@ app.post("/api/score", throttle("score", 60, 60_000), async (req, res) => {
   } else {
     board.scores.push({
       id: crypto.randomUUID(),
-      challenge, name, seconds: rounded, at: Date.now(),
+      challenge, name, seconds: rounded, at: Date.now(), attempts: 1,
     });
   }
 
@@ -209,6 +212,7 @@ app.post("/api/score", throttle("score", 60, 60_000), async (req, res) => {
   res.json({
     improved: true,
     best: rounded,
+    attempts: board.scores.find((x) => key(x.challenge, x.name) === k)?.attempts ?? 1,
     rank: scores.find((s) => key(s.challenge, s.name) === k)?.rank ?? null,
     scores,
   });
