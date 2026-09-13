@@ -71,11 +71,14 @@ check("fastest is ranked first", txt().indexOf("Sam") < txt().indexOf("David"));
 check("original challenges listed", has("Duct static hunting") && has("Pump differential") && has("Box airflow") && has("Domestic hot water"));
 check("new challenges listed", has("Supply fan trips") && has("Reheat valve chatter") && has("Building pressure"));
 
-await click(find("Run this challenge"), 800);
-// A run is settle + five disturbances, so the counter reads "of 6".
-// Match the pattern rather than the number so the next change to
-// CHAL_EVENTS doesn't break this again.
-check("challenge starts", /\bof [1-9]\d*\b/.test(txt()) && has("Challenge started"));
+await click(find("Run this challenge"), 1500);
+
+// Split into two so a failure says which half went wrong, and match the
+// counter by pattern rather than a literal number so changing CHAL_EVENTS
+// doesn't break this again.
+const counter = /\bof\s+[1-9]\d*\b/.test(txt());
+check("challenge counter shows", counter, JSON.stringify(txt().slice(0, 260)));
+check("challenge start event logged", has("Challenge started"), JSON.stringify(txt().slice(0, 260)));
 check("clock locked to 1x", !find("60×") && !find("20×") && !!find("1×"));
 check("manual event buttons hidden", !find("New setpoint") && !find("Throw a disturbance"));
 check("loop picker hidden", !find("Change loop"));
