@@ -405,6 +405,9 @@ function makeCall() {
    slow thermal loop would mean a twenty minute sitting.
    ============================================================ */
 
+// How many disturbances a challenge run throws after the first settle.
+const CHAL_EVENTS = 5;
+
 const CHALLENGES = [
   {
     id: "duct-static",
@@ -413,7 +416,7 @@ const CHALLENGES = [
     loop: "static",
     start: { pb: 0.5, ti: 15, td: 0 },
     step: 0.4,        // setpoint move, in engineering units
-    event: 0,         // index into the loop's event list
+    events: [0, 1, 2, 1, 0],   // indices into the loop's event list
   },
   {
     id: "chw-dp",
@@ -422,7 +425,7 @@ const CHALLENGES = [
     loop: "dp",
     start: { pb: 5.5, ti: 10, td: 0 },
     step: 2,
-    event: 0,
+    events: [0, 1, 0, 1, 0],
   },
   {
     id: "vav-flow",
@@ -431,7 +434,7 @@ const CHALLENGES = [
     loop: "cfm",
     start: { pb: 300, ti: 20, td: 0 },
     step: 250,
-    event: 0,
+    events: [0, 1, 0, 1, 0],
   },
   {
     id: "dhw-temp",
@@ -440,7 +443,64 @@ const CHALLENGES = [
     loop: "dhw",
     start: { pb: 12, ti: 30, td: 0 },
     step: 5,
-    event: 0,
+    events: [0, 1, 0, 1, 0],
+  },
+
+  /* ---- six more, all fast loops so a run stays under a few minutes ---- */
+
+  {
+    id: "static-filters",
+    title: "Duct static, loaded filters",
+    blurb: "Same fan, but the filters are near the end of their life and the boxes keep hunting for air. Five load swings in a row.",
+    loop: "static",
+    start: { pb: 4.5, ti: 240, td: 0 },
+    step: 0.5,
+    events: [2, 0, 1, 2, 0],
+  },
+  {
+    id: "static-sluggish",
+    title: "Duct static, tuned scared",
+    blurb: "Somebody had a callback and detuned this until it could not keep up. Nothing is unstable — it is just far too slow.",
+    loop: "static",
+    start: { pb: 5.5, ti: 480, td: 0 },
+    step: 0.6,
+    events: [0, 1, 0, 2, 1],
+  },
+  {
+    id: "dp-noreset",
+    title: "Pump DP, reset switched off",
+    blurb: "Rock steady and permanently off setpoint. The last tech killed the hunting by turning integral action off entirely.",
+    loop: "dp",
+    start: { pb: 22, ti: 600, td: 0 },
+    step: 3,
+    events: [1, 0, 1, 0, 1],
+  },
+  {
+    id: "bldg-static",
+    title: "Building pressure, windy day",
+    blurb: "Thousandths of an inch of water, a signal that is mostly noise, and doors that people keep opening.",
+    loop: "bldg",
+    start: { pb: 0.045, ti: 15, td: 0 },
+    step: 0.03,
+    events: [0, 1, 2, 0, 1],
+  },
+  {
+    id: "vav-chatter",
+    title: "Box airflow, rate action",
+    blurb: "Rate action on a noisy flow signal. The trend looks fine and the damper never stops moving.",
+    loop: "cfm",
+    start: { pb: 900, ti: 60, td: 20 },
+    step: 300,
+    events: [1, 0, 1, 0, 1],
+  },
+  {
+    id: "dhw-copied",
+    title: "Hot water, settings off another unit",
+    blurb: "These numbers came off a coil loop with completely different dynamics. Gain and Tn are both wrong for this valve.",
+    loop: "dhw",
+    start: { pb: 4, ti: 300, td: 0 },
+    step: 8,
+    events: [0, 1, 0, 1, 0],
   },
 ];
 
@@ -1709,15 +1769,17 @@ export default function App() {
         while (acc >= DT && n < 6000) { step(sim.current, ll, gg, DT, mm); acc -= DT; n++; }
         if (acc > DT) acc = 0;
       }
-      // challenge script: first recovery verified -> throw the disturbance;
-      // second recovery verified -> the run is over
+      // Challenge script: settle the loop, then ride out five disturbances.
+      // Each verified recovery throws the next one. A tune that survives one
+      // load change can be luck; surviving five is a tune.
       const cc = R.current.chal;
       if (cc) {
         const s = sim.current;
-        if (s.passes === 1 && !s.stage2) {
-          s.stage2 = true;
-          rollEventFixed(s, R.current.l, cc.event);
-        } else if (s.passes >= 2 && !s.done) {
+        if (s.passes >= 1 && s.passes <= CHAL_EVENTS && (s.thrown || 0) < s.passes) {
+          s.thrown = s.passes;
+          rollEventFixed(s, R.current.l, cc.events[(s.passes - 1) % cc.events.length]);
+        }
+        if (s.passes > CHAL_EVENTS && !s.done) {
           s.done = true;
           R.current.finish(Math.round(s.t));
         }
@@ -1778,7 +1840,11 @@ export default function App() {
             {mmss(v.t)}
           </span>
           <span style={{ fontSize: 12.5 }}>
-            {v.passes >= 2 ? "Run complete" : v.passes === 1 ? "Recovered once — now ride out the load change" : "Settle it, then hold it through a disturbance"}
+            {v.passes > CHAL_EVENTS
+              ? "Run complete"
+              : v.passes === 0
+                ? `Settle it, then ride out ${CHAL_EVENTS} disturbances`
+                : `Recovered ${v.passes} of ${CHAL_EVENTS + 1} — ${CHAL_EVENTS + 1 - v.passes} to go`}
           </span>
           <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15 }}>
             {Math.min(v.passes, 2)} of 2

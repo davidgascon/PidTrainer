@@ -28,7 +28,11 @@ const DIST = path.join(__dirname, "..", "dist");
 
 // Challenge ids the API will accept. Anything else is rejected, so a typo in
 // the client can't quietly create a phantom board nobody can find.
-const CHALLENGES = ["duct-static", "chw-dp", "vav-flow", "dhw-temp"];
+const CHALLENGES = [
+  "duct-static", "chw-dp", "vav-flow", "dhw-temp",
+  "static-filters", "static-sluggish", "dp-noreset",
+  "bldg-static", "vav-chatter", "dhw-copied",
+];
 
 const NAME_MAX = 20;
 const MIN_SECONDS = 5;        // nothing legitimate finishes faster
