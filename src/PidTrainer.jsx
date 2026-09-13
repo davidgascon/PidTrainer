@@ -405,8 +405,34 @@ function makeCall() {
    slow thermal loop would mean a twenty minute sitting.
    ============================================================ */
 
+/* Revision, as XX.XX. Bump the right pair for anything small — a tweaked
+   scenario, copy changes, a bug fix. Bump the left pair and reset the right
+   to 00 when something changes how the thing is used: a new mode, a change
+   to how runs are scored, a controller flavour. Edit it here and nowhere
+   else; the footer reads from this. */
+const VERSION = "02.06";
+
 // How many disturbances a challenge run throws after the first settle.
+// Date a record was set. Short, and no time of day — nobody cares that a
+// duct static PB was set at 14:07.
+const shortDate = (ms) => {
+  if (!ms) return "—";
+  try {
+    return new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "2-digit" });
+  } catch { return "—"; }
+};
+
+const STATES = [
+  { label: "in band", color: C.ok },
+  { label: "off setpoint", color: C.amber },
+  { label: "out of control", color: C.fault },
+];
+
 const CHAL_EVENTS = 5;
+
+// Recoveries needed to sign off a blind service call. Lower than a challenge
+// run: this is "prove it isn't luck", not a timed contest.
+const BLIND_PASSES = 2;
 
 const CHALLENGES = [
   {
@@ -451,20 +477,26 @@ const CHALLENGES = [
   {
     id: "static-filters",
     title: "Duct static, loaded filters",
-    blurb: "Same fan, but the filters are near the end of their life and the boxes keep hunting for air. Five load swings in a row.",
+    blurb: "Fan surging, and the filters are near the end of their life. Milder than the headline one, but five load swings in a row.",
     loop: "static",
-    start: { pb: 4.5, ti: 240, td: 0 },
+    start: { pb: 1, ti: 45, td: 0 },
     step: 0.5,
     events: [2, 0, 1, 2, 0],
   },
   {
-    id: "static-sluggish",
-    title: "Duct static, tuned scared",
-    blurb: "Somebody had a callback and detuned this until it could not keep up. Nothing is unstable — it is just far too slow.",
+    id: "static-trip",
+    title: "Supply fan trips",
+    blurb: "Detuned after a callback, and partway through the run the supply fan drops out. Static goes to zero, the controller winds up against a wall, and then the fan restarts. Getting it back is the challenge.",
     loop: "static",
-    start: { pb: 5.5, ti: 480, td: 0 },
+    start: { pb: 10, ti: 300, td: 0 },
     step: 0.6,
-    events: [0, 1, 0, 2, 1],
+    events: [
+      0,
+      { trip: 40, text: "SUPPLY FAN TRIPPED — static at zero, the VFD command is doing nothing" },
+      1,
+      { trip: 25, text: "FAN TRIPPED AGAIN — starter is dropping out under load" },
+      0,
+    ],
   },
   {
     id: "dp-noreset",
@@ -486,12 +518,12 @@ const CHALLENGES = [
   },
   {
     id: "vav-chatter",
-    title: "Box airflow, rate action",
-    blurb: "Rate action on a noisy flow signal. The trend looks fine and the damper never stops moving.",
-    loop: "cfm",
-    start: { pb: 900, ti: 60, td: 20 },
-    step: 300,
-    events: [1, 0, 1, 0, 1],
+    title: "Reheat valve chatter",
+    blurb: "Rate action on a noisy leaving air sensor. The temperature trend looks fine and the valve never stops moving.",
+    loop: "vav-rh",
+    start: { pb: 30, ti: 40, td: 20 },
+    step: 4,
+    events: [0, 1, 0, 1, 0],
   },
   {
     id: "dhw-copied",
@@ -840,7 +872,10 @@ function step(s, l, g, dt, mode) {
 
   s.base += (s.baseTarget - s.base) * (dt / 25);
 
-  const target = s.base + p.k * ud;
+  // While tripped the final element has no authority at all — the fan is off,
+  // the pump is stopped — so the process falls back to its passive value.
+  const tripped = s.tripUntil != null && s.t < s.tripUntil;
+  const target = s.base + (tripped ? 0 : p.k) * ud;
   s.x1 += ((target - s.x1) / p.tau1) * dt;
   s.x2 += ((s.x1 - s.x2) / p.tau2) * dt;
   s.pv = s.x2 + (Math.random() - 0.5) * p.noise;
@@ -889,6 +924,16 @@ function rollStep(s, l) {
 }
 
 // Same disturbance every time, for challenge runs.
+// A hard failure rather than a load change: the equipment stops, the
+// measurement collapses to whatever the process does with no help at all,
+// and the controller winds up against a wall until it restarts.
+function rollTrip(s, l, secs, text) {
+  s.tripUntil = s.t + secs;
+  s.stepAt = s.t; s.inBand = 0; s.verified = null; s.worst = 0;
+  s.event = { t: s.t, text };
+  return s.event;
+}
+
 function rollEventFixed(s, l, idx) {
   const e = l.events[idx % l.events.length];
   s.baseTarget = s.base + e.d;
@@ -1098,7 +1143,7 @@ function buildDebrief(l, g, s, hints, mode) {
   const ref = l.truth.ref;
   const kpRef = 100 / ref.pb;
   const stable = d.code === "good";
-  const enough = s.passes >= 2;
+  const enough = s.passes >= BLIND_PASSES;
   const gentle = travel < 900;
   const pass = stable && enough && gentle;
 
@@ -1107,7 +1152,7 @@ function buildDebrief(l, g, s, hints, mode) {
   const tiOk = R.ti > 0 && near(R.ti, ref.ti);
 
   const rows = [
-    ["Recoveries verified", `${s.passes} of 2`],
+    ["Recoveries verified", `${s.passes} of ${BLIND_PASSES}`],
     ["Last settling time", s.verified != null ? `${Math.round(s.verified)} s` : "not settled"],
     ["Worst deviation", `${fmt(s.worst, l)} ${l.io.unit}`],
     [`${cap(l.io.outShort)} travel`, `${travel.toFixed(0)} %/hr`],
@@ -1497,6 +1542,50 @@ function Nav({ view, setView, chal, onExit }) {
    LEADERBOARD
    ============================================================ */
 
+
+/* Copies a link straight to this challenge's board. Falls back to a text
+   box if the clipboard API isn't available — it needs HTTPS, and someone
+   will inevitably open this over plain http on the LAN. */
+function ShareButton({ challenge }) {
+  const [state, setState] = useState("idle");   // idle | copied | manual
+  const url = `${window.location.origin}/?c=${challenge.id}`;
+
+  const share = async () => {
+    // On a phone this opens the real share sheet, which is what people want
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: `Loop Lab — ${challenge.title}`, text: "Beat my time.", url });
+        return;
+      } catch { /* dismissed, fall through to copying */ }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      setState("copied");
+      setTimeout(() => setState("idle"), 2500);
+    } catch {
+      setState("manual");
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <button onClick={share}
+        style={{ ...btn(false), color: C.paper, borderColor: C.bezelLight, padding: "6px 11px", fontSize: 14 }}>
+        {state === "copied" ? "Link copied" : "Share this board"}
+      </button>
+      {state === "manual" && (
+        <input readOnly value={url} onFocus={(e) => e.target.select()}
+          aria-label="Link to this challenge"
+          style={{
+            display: "block", width: "100%", marginTop: 8, padding: "7px 9px",
+            fontFamily: FONT_B, fontSize: 12.5, borderRadius: 4,
+            border: `1px solid ${C.bezelLight}`, background: C.chassis, color: C.ink,
+          }} />
+      )}
+    </div>
+  );
+}
+
 function Leaderboard({ initial, onPlay }) {
   const [cid, setCid] = useState(initial || CHALLENGES[0].id);
   const [scores, setScores] = useState(null);
@@ -1515,6 +1604,19 @@ function Leaderboard({ initial, onPlay }) {
   }, []);
 
   useEffect(() => { load(cid); }, [cid, load]);
+
+  // Keep the URL pointing at whichever board is on screen, so copying from
+  // the address bar works as well as the share button. replaceState rather
+  // than pushState: flicking between boards shouldn't fill up the back button.
+  useEffect(() => {
+    try {
+      const u = new URL(window.location.href);
+      if (u.searchParams.get("c") !== cid) {
+        u.searchParams.set("c", cid);
+        window.history.replaceState({}, "", u);
+      }
+    } catch { /* no history API, nothing lost */ }
+  }, [cid]);
 
   const openAdmin = async (row) => {
     setTarget(row); setDraft(row.name); setErr(null);
@@ -1552,6 +1654,7 @@ function Leaderboard({ initial, onPlay }) {
         <div style={{ fontFamily: FONT_D, fontSize: 12.5, color: C.gridBold, letterSpacing: 1.6, fontWeight: 600 }}>LEADERBOARD</div>
         <div style={{ fontFamily: FONT_D, fontSize: 25, fontWeight: 700, color: C.paper, lineHeight: 1.05 }}>{ch.title}</div>
         <div style={{ fontSize: 12.5, color: C.chassisDark, marginTop: 3, lineHeight: 1.45 }}>{ch.blurb}</div>
+        <ShareButton challenge={ch} />
       </div>
 
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
@@ -1595,8 +1698,13 @@ function Leaderboard({ initial, onPlay }) {
                   fontFamily: FONT_D, fontSize: 19, fontWeight: 700, minWidth: 30,
                   color: row.rank === 1 ? C.amber : C.label,
                 }}>{row.rank}</span>
-                <span style={{ fontFamily: FONT_D, fontSize: 19, fontWeight: 600, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {row.name}
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: "block", fontFamily: FONT_D, fontSize: 19, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {row.name}
+                  </span>
+                  <span style={{ display: "block", fontSize: 11, color: C.label, whiteSpace: "nowrap" }}>
+                    {shortDate(row.at)} · {row.attempts || 1} {(row.attempts || 1) === 1 ? "run" : "runs"}
+                  </span>
                 </span>
                 <span style={{ fontFamily: FONT_D, fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
                   {mmss(row.seconds)}
@@ -1605,6 +1713,7 @@ function Leaderboard({ initial, onPlay }) {
             ))}
             <div style={{ fontSize: 11, color: C.label, paddingTop: 9 }}>
               One time per person per challenge — a better run replaces the old one.
+              The date is when that time was set; runs counts every completed attempt.
             </div>
           </div>
         )}
@@ -1683,7 +1792,14 @@ export default function App() {
   const [picker, setPicker] = useState(false);
   const [hints, setHints] = useState(0);
   const [debrief, setDebrief] = useState(null);
-  const [view, setView] = useState("train");        // train | board
+  // A ?c=<challenge> link opens straight onto that board.
+  const shared = (() => {
+    try {
+      const c = new URL(window.location.href).searchParams.get("c");
+      return CHALLENGES.some((x) => x.id === c) ? c : null;
+    } catch { return null; }
+  })();
+  const [view, setView] = useState(shared ? "board" : "train");   // train | board
   const [chal, setChal] = useState(null);           // active challenge definition
   const [result, setResult] = useState(null);       // finished run awaiting a name
   const [name, setName] = useState("");
@@ -1777,7 +1893,9 @@ export default function App() {
         const s = sim.current;
         if (s.passes >= 1 && s.passes <= CHAL_EVENTS && (s.thrown || 0) < s.passes) {
           s.thrown = s.passes;
-          rollEventFixed(s, R.current.l, cc.events[(s.passes - 1) % cc.events.length]);
+          const ev = cc.events[(s.passes - 1) % cc.events.length];
+          if (ev && ev.trip) rollTrip(s, R.current.l, ev.trip, ev.text);
+          else rollEventFixed(s, R.current.l, ev);
         }
         if (s.passes > CHAL_EVENTS && !s.done) {
           s.done = true;
@@ -1798,8 +1916,24 @@ export default function App() {
   }, []);
 
   const err = v.pv - v.sp;
-  const state = Math.abs(err) <= l.sp.band ? "in band" : Math.abs(err) <= l.sp.band * 3 ? "off setpoint" : "out of control";
-  const sc = Math.abs(err) <= l.sp.band ? C.ok : Math.abs(err) <= l.sp.band * 3 ? C.amber : C.fault;
+
+  // Worsening is reported immediately; improving needs to clear the boundary
+  // by 25% before it counts. Without that, a measurement parked exactly on
+  // the edge flips the label many times a second and the row jumps around.
+  const lvlRef = useRef(0);
+  {
+    const a = Math.abs(err), b = l.sp.band;
+    const raw = a <= b ? 0 : a <= b * 3 ? 1 : 2;
+    const prev = lvlRef.current;
+    if (raw > prev) lvlRef.current = raw;
+    else if (raw < prev) {
+      const clear = raw === 0 ? a <= b * 0.75 : a <= b * 2.25;
+      if (clear) lvlRef.current = raw;
+    }
+  }
+  const level = lvlRef.current;
+  const state = STATES[level].label;
+  const sc = STATES[level].color;
   const card = { background: C.chassis, border: `1px solid ${C.chassisDark}`, borderRadius: 5, padding: 14, marginTop: 10 };
 
   const groups = [...new Set(L.map((x) => x.group))];
@@ -1809,7 +1943,7 @@ export default function App() {
       <div style={{ background: C.chassis, minHeight: "100vh", padding: 12, fontFamily: FONT_B, color: C.ink }}>
         <style>{sheet}</style>
         <Nav view={view} setView={setView} chal={chal} onExit={exitChallenge} />
-        <Leaderboard initial={chal?.id} onPlay={(id) => startChallenge(id)} />
+        <Leaderboard initial={chal?.id || shared} onPlay={(id) => startChallenge(id)} />
       </div>
     );
   }
@@ -1846,8 +1980,8 @@ export default function App() {
                 ? `Settle it, then ride out ${CHAL_EVENTS} disturbances`
                 : `Recovered ${v.passes} of ${CHAL_EVENTS + 1} — ${CHAL_EVENTS + 1 - v.passes} to go`}
           </span>
-          <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15 }}>
-            {Math.min(v.passes, 2)} of 2
+          <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15, fontVariantNumeric: "tabular-nums" }}>
+            {Math.min(v.passes, CHAL_EVENTS + 1)} of {CHAL_EVENTS + 1}
           </span>
         </div>
       )}
@@ -1855,7 +1989,7 @@ export default function App() {
       {l.blind && (
         <div style={{ background: C.amber, color: "#241a05", padding: "8px 14px", fontSize: 12.5, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", borderBottom: `4px solid ${C.bezel}`, marginTop: -4 }}>
           <span style={{ fontFamily: FONT_D, fontSize: 16, fontWeight: 700 }}>
-            {Math.min(v.passes, 2)} of 2 recoveries verified
+            {Math.min(v.passes, BLIND_PASSES)} of {BLIND_PASSES} recoveries verified
           </span>
           <span style={{ opacity: 0.85 }}>Step it, disturb it, then sign off.</span>
           <span style={{ marginLeft: "auto", fontFamily: FONT_D, fontWeight: 700, fontSize: 15 }}>{hints} hints</span>
@@ -1887,9 +2021,13 @@ export default function App() {
         <Readout label={cap(l.io.pv)} value={fmt(v.pv, l)} unit={l.io.unit} big color={sc} />
         <Readout label="Setpoint" value={fmt(v.sp, l)} unit={l.io.unit} color={C.chw} />
         <Readout label={cap(l.io.outShort)} value={v.u.toFixed(0)} unit="%" color={l.io.color} />
-        <div style={{ marginLeft: "auto", textAlign: "right" }}>
-          <div style={{ fontFamily: FONT_D, fontSize: 18, fontWeight: 600, color: sc }}>{state}</div>
-          <div style={{ fontSize: 11, color: C.label }}>{v.travel.toFixed(0)} %/hr travel</div>
+        {/* Width is pinned to the longest label. Left to size itself, this
+            block grows when the text changes, wraps onto its own line, and
+            shoves the whole page down — several times a second when the
+            measurement is sitting right on the edge of the band. */}
+        <div style={{ marginLeft: "auto", textAlign: "right", minWidth: 124, flexShrink: 0 }}>
+          <div style={{ fontFamily: FONT_D, fontSize: 18, fontWeight: 600, color: sc, whiteSpace: "nowrap" }}>{state}</div>
+          <div style={{ fontSize: 11, color: C.label, whiteSpace: "nowrap" }}>{v.travel.toFixed(0)} %/hr travel</div>
         </div>
       </div>
 
@@ -2053,7 +2191,7 @@ export default function App() {
       </div>
 
       <div style={{ textAlign: "center", fontSize: 11, color: C.label, padding: "14px 0 6px" }}>
-        Loop Lab · training mode<ActiveCount />
+        Loop Lab · training mode<ActiveCount /> · v{VERSION}
       </div>
       </div>
 
